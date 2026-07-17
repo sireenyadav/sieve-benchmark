@@ -15,34 +15,42 @@
 using namespace std;
 using steady_clock_t = std::chrono::steady_clock;
 
-// ---------- Configuration (pushed to L1 limit) ----------
-constexpr uint32_t SEG_ODDS  = 120120;                 // 15 KB – still fits L1
-constexpr uint32_t SEG_SPAN  = SEG_ODDS * 2;           // 240240
-constexpr uint32_t SEG_WORDS = (SEG_ODDS + 63) / 64;   // 1878 words ≈ 15 KB
+// ---------- Configuration (pushed to 22.5 KB – fits 64 KB L1) ----------
+constexpr uint32_t SEG_ODDS  = 180180;                 // 180180 odds → 22.5 KB
+constexpr uint32_t SEG_SPAN  = SEG_ODDS * 2;           // 360360
+constexpr uint32_t SEG_WORDS = (SEG_ODDS + 63) / 64;   // 2816 words
 constexpr uint32_t SMALL_LIMIT = 1'000'000;
 
-constexpr uint32_t MAX_BLOCKS = 2'000'000;             // half again
+constexpr uint32_t MAX_BLOCKS = 2'000'000;
 constexpr uint32_t BATCH_SIZE = 256;
-constexpr uint32_t BLOCK_NOT_DONE = 0xFFFFFFFF;
+constexpr uint64_t BLOCK_NOT_DONE = 0xFFFFFFFFFFFFFFFFULL;
 
 alignas(64) uint64_t template_seg[SEG_WORDS];
 vector<uint32_t> base_primes;
 
-// Per‑thread accumulation array (no atomics in hot path)
+// Separate small (<64) and large (>=64) primes for optimal inner loops
+vector<uint32_t> small_primes;
+struct LargePrime {
+    uint32_t p;
+    uint32_t step_words;   // p / 64
+    uint32_t bit_step;     // p % 64
+};
+vector<LargePrime> large_primes;
+
 unique_ptr<uint64_t[]> block_counts_raw;
 atomic<bool> stop_now{false};
 atomic<uint64_t> next_block{1};
 
-// ---------- Bit operations ----------
+// ---------- Bit operations (only used for small primes) ----------
 static inline void clear_bit(uint64_t* buf, uint32_t idx) {
     buf[idx >> 6] &= ~(1ULL << (idx & 63));
 }
 
-// ---------- NEON popcount – 32‑word unrolled ----------
+// ---------- NEON popcount – 64‑word unrolled ----------
 static uint32_t popcount_segment(const uint64_t* data) {
     uint32_t total = 0;
     const uint64_t* end = data + SEG_WORDS;
-    while (data + 32 <= end) {
+    while (data + 64 <= end) {
         uint64x2_t v0  = vld1q_u64(data);
         uint64x2_t v1  = vld1q_u64(data+2);
         uint64x2_t v2  = vld1q_u64(data+4);
@@ -59,6 +67,22 @@ static uint32_t popcount_segment(const uint64_t* data) {
         uint64x2_t v13 = vld1q_u64(data+26);
         uint64x2_t v14 = vld1q_u64(data+28);
         uint64x2_t v15 = vld1q_u64(data+30);
+        uint64x2_t v16 = vld1q_u64(data+32);
+        uint64x2_t v17 = vld1q_u64(data+34);
+        uint64x2_t v18 = vld1q_u64(data+36);
+        uint64x2_t v19 = vld1q_u64(data+38);
+        uint64x2_t v20 = vld1q_u64(data+40);
+        uint64x2_t v21 = vld1q_u64(data+42);
+        uint64x2_t v22 = vld1q_u64(data+44);
+        uint64x2_t v23 = vld1q_u64(data+46);
+        uint64x2_t v24 = vld1q_u64(data+48);
+        uint64x2_t v25 = vld1q_u64(data+50);
+        uint64x2_t v26 = vld1q_u64(data+52);
+        uint64x2_t v27 = vld1q_u64(data+54);
+        uint64x2_t v28 = vld1q_u64(data+56);
+        uint64x2_t v29 = vld1q_u64(data+58);
+        uint64x2_t v30 = vld1q_u64(data+60);
+        uint64x2_t v31 = vld1q_u64(data+62);
 
         total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v0)));
         total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v1)));
@@ -76,8 +100,24 @@ static uint32_t popcount_segment(const uint64_t* data) {
         total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v13)));
         total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v14)));
         total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v15)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v16)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v17)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v18)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v19)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v20)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v21)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v22)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v23)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v24)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v25)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v26)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v27)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v28)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v29)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v30)));
+        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v31)));
 
-        data += 32;
+        data += 64;
     }
     while (data < end)
         total += __builtin_popcountll(*data++);
@@ -126,6 +166,14 @@ void build_base_primes() {
     base_primes.reserve(100000);
     for (uint32_t p=17; p<=SMALL_LIMIT; ++p)
         if (is_prime[p]) base_primes.push_back(p);
+
+    // Split into small (<64) and large (>=64) primes, precompute large parameters
+    for (uint32_t p : base_primes) {
+        if (p < 64)
+            small_primes.push_back(p);
+        else
+            large_primes.push_back({p, p / 64, p % 64});
+    }
 }
 
 void sieve_worker(int thread_id, int num_threads) {
@@ -150,7 +198,8 @@ void sieve_worker(int thread_id, int num_threads) {
 
             memcpy(sieve, template_seg, sizeof(sieve));
 
-            for (uint32_t p : base_primes) {
+            // ---------- Small primes (<64): 8‑way unrolled bit clearing ----------
+            for (uint32_t p : small_primes) {
                 uint64_t p2 = (uint64_t)p * (uint64_t)p;
                 if (p2 >= high) break;
 
@@ -179,7 +228,37 @@ void sieve_worker(int thread_id, int num_threads) {
                 }
             }
 
-            // Thread‑local store (no atomic overhead)
+            // ---------- Large primes (>=64): word‑level mask rotation ----------
+            for (auto& lp : large_primes) {
+                uint64_t p = lp.p;
+                uint64_t p2 = (uint64_t)p * (uint64_t)p;
+                if (p2 >= high) break;
+
+                uint64_t start = (low + p - 1) / p * p;
+                if (start < p2) start = p2;
+                if ((start & 1ULL) == 0) start += p;
+
+                uint64_t idx = (start - low - 1) >> 1;
+                uint64_t word = idx >> 6;
+                uint64_t mask = 1ULL << (idx & 63);
+                uint32_t step_words = lp.step_words;
+                uint32_t bit_step   = lp.bit_step;
+
+                if (bit_step == 0) {
+                    // p is multiple of 64, mask never rotates
+                    while (word < SEG_WORDS) {
+                        sieve[word] &= ~mask;
+                        word += step_words;
+                    }
+                } else {
+                    while (word < SEG_WORDS) {
+                        sieve[word] &= ~mask;
+                        word += step_words;
+                        mask = __builtin_rotateleft64(mask, bit_step);
+                    }
+                }
+            }
+
             block_counts_raw[block] = popcount_segment(sieve);
         }
     }
@@ -196,9 +275,8 @@ int main() {
     build_base_primes();
 
     block_counts_raw.reset(new uint64_t[MAX_BLOCKS]);
-    memset(block_counts_raw.get(), 0xFF, MAX_BLOCKS * sizeof(uint64_t)); // sentinel -1
+    memset(block_counts_raw.get(), 0xFF, MAX_BLOCKS * sizeof(uint64_t));
 
-    // Pre‑compute block 0
     block_counts_raw[0] = count_small_primes(SEG_SPAN - 1);
 
     unsigned hc = thread::hardware_concurrency();
@@ -216,12 +294,11 @@ int main() {
     stop_now.store(true, memory_order_relaxed);
     for (auto& t : workers) t.join();
 
-    // Merge without atomics
     uint64_t exact_primes = 0;
     uint64_t completed_blocks = 0;
     while (completed_blocks < MAX_BLOCKS) {
         uint64_t c = block_counts_raw[completed_blocks];
-        if (c == 0xFFFFFFFFFFFFFFFF) break;
+        if (c == BLOCK_NOT_DONE) break;
         exact_primes += c;
         ++completed_blocks;
     }
@@ -231,12 +308,14 @@ int main() {
     double actual_duration = chrono::duration_cast<chrono::duration<double>>(end_time - start_time).count();
 
     cout << "\n======================================================\n";
-    cout << "           ULTRA SEGMENTED BIT-SIEVE                 \n";
+    cout << "           WORD-LEVEL BINARY SIEVE                   \n";
     cout << "======================================================\n";
     cout << "Execution time       : " << actual_duration << " seconds\n";
     cout << "Search space limit   : " << format_num(exact_search_space) << "\n";
     cout << "Total primes found   : " << format_num(exact_primes) << "\n";
     cout << "Base primes used     : " << format_num(base_primes.size()) << "\n";
+    cout << "  (small <64)        : " << small_primes.size() << "\n";
+    cout << "  (large >=64)       : " << large_primes.size() << "\n";
     cout << "Threads              : " << num_threads << "\n";
     cout << "Numbers processed/sec: " << format_num((uint64_t)(exact_search_space / actual_duration)) << "\n";
     cout << "======================================================\n";

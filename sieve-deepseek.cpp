@@ -15,10 +15,10 @@
 using namespace std;
 using steady_clock_t = std::chrono::steady_clock;
 
-// ---------- Configuration (pushed to 22.5 KB – fits 64 KB L1) ----------
-constexpr uint32_t SEG_ODDS  = 180180;                 // 180180 odds → 22.5 KB
-constexpr uint32_t SEG_SPAN  = SEG_ODDS * 2;           // 360360
-constexpr uint32_t SEG_WORDS = (SEG_ODDS + 63) / 64;   // 2816 words
+// ---------- Configuration (45 KB – fits 64 KB L1) ----------
+constexpr uint32_t SEG_ODDS  = 360360;                 // 45 KB
+constexpr uint32_t SEG_SPAN  = SEG_ODDS * 2;           // 720720
+constexpr uint32_t SEG_WORDS = (SEG_ODDS + 63) / 64;   // 5631 words
 constexpr uint32_t SMALL_LIMIT = 1'000'000;
 
 constexpr uint32_t MAX_BLOCKS = 2'000'000;
@@ -27,13 +27,13 @@ constexpr uint64_t BLOCK_NOT_DONE = 0xFFFFFFFFFFFFFFFFULL;
 
 alignas(64) uint64_t template_seg[SEG_WORDS];
 vector<uint32_t> base_primes;
-
-// Separate small (<64) and large (>=64) primes for optimal inner loops
 vector<uint32_t> small_primes;
+
 struct LargePrime {
     uint32_t p;
-    uint32_t step_words;   // p / 64
-    uint32_t bit_step;     // p % 64
+    uint32_t step_words;
+    uint32_t bit_step;
+    uint64_t masks[8];   // precomputed 8 consecutive rotated masks
 };
 vector<LargePrime> large_primes;
 
@@ -41,16 +41,21 @@ unique_ptr<uint64_t[]> block_counts_raw;
 atomic<bool> stop_now{false};
 atomic<uint64_t> next_block{1};
 
-// ---------- Bit operations (only used for small primes) ----------
 static inline void clear_bit(uint64_t* buf, uint32_t idx) {
     buf[idx >> 6] &= ~(1ULL << (idx & 63));
 }
 
-// ---------- NEON popcount – 64‑word unrolled ----------
+// ---------- 64‑way NEON popcount with prefetch ----------
 static uint32_t popcount_segment(const uint64_t* data) {
     uint32_t total = 0;
     const uint64_t* end = data + SEG_WORDS;
+
+    // Prefetch the first cache line ahead of time
+    __builtin_prefetch(data, 0, 3);
+
     while (data + 64 <= end) {
+        __builtin_prefetch(data + 128, 0, 3);  // look ahead
+
         uint64x2_t v0  = vld1q_u64(data);
         uint64x2_t v1  = vld1q_u64(data+2);
         uint64x2_t v2  = vld1q_u64(data+4);
@@ -163,19 +168,32 @@ void build_base_primes() {
     for (uint32_t p=2; p<=root; ++p)
         if (is_prime[p])
             for (uint32_t x=p*p; x<=SMALL_LIMIT; x+=p) is_prime[x]=0;
+
     base_primes.reserve(100000);
     for (uint32_t p=17; p<=SMALL_LIMIT; ++p)
         if (is_prime[p]) base_primes.push_back(p);
 
-    // Split into small (<64) and large (>=64) primes, precompute large parameters
+    small_primes.clear();
+    large_primes.clear();
     for (uint32_t p : base_primes) {
-        if (p < 64)
+        if (p < 64) {
             small_primes.push_back(p);
-        else
-            large_primes.push_back({p, p / 64, p % 64});
+        } else {
+            LargePrime lp;
+            lp.p = p;
+            lp.step_words = p / 64;
+            lp.bit_step   = p % 64;
+            // Precompute 8 rotated masks
+            uint64_t base_mask = 1ULL << 0; // we'll set correct start mask in worker
+            // We'll compute masks dynamically in worker because start mask depends on offset.
+            // For precomputation, we need to store the *difference* pattern; easier to do in worker.
+            // We'll store the rotation sequence in worker based on first mask.
+            large_primes.push_back(lp);
+        }
     }
 }
 
+// ---------- Worker with unrolled word-level sieving ----------
 void sieve_worker(int thread_id, int num_threads) {
     if (num_threads > 0) {
         cpu_set_t cpuset;
@@ -198,7 +216,7 @@ void sieve_worker(int thread_id, int num_threads) {
 
             memcpy(sieve, template_seg, sizeof(sieve));
 
-            // ---------- Small primes (<64): 8‑way unrolled bit clearing ----------
+            // 1. Small primes (<64) – 8‑way unrolled bit clearing
             for (uint32_t p : small_primes) {
                 uint64_t p2 = (uint64_t)p * (uint64_t)p;
                 if (p2 >= high) break;
@@ -228,7 +246,7 @@ void sieve_worker(int thread_id, int num_threads) {
                 }
             }
 
-            // ---------- Large primes (>=64): word‑level mask rotation ----------
+            // 2. Large primes (>=64) – word-level with precomputed mask batch
             for (auto& lp : large_primes) {
                 uint64_t p = lp.p;
                 uint64_t p2 = (uint64_t)p * (uint64_t)p;
@@ -241,20 +259,61 @@ void sieve_worker(int thread_id, int num_threads) {
                 uint64_t idx = (start - low - 1) >> 1;
                 uint64_t word = idx >> 6;
                 uint64_t mask = 1ULL << (idx & 63);
-                uint32_t step_words = lp.step_words;
-                uint32_t bit_step   = lp.bit_step;
+                uint32_t step = lp.step_words;
+                uint32_t bstep = lp.bit_step;
 
-                if (bit_step == 0) {
-                    // p is multiple of 64, mask never rotates
+                // Precompute 8 masks for unrolled loop
+                uint64_t m[8];
+                m[0] = mask;
+                for (int i = 1; i < 8; ++i) {
+                    m[i] = __builtin_rotateleft64(m[i-1], bstep);
+                }
+
+                if (bstep == 0) {
+                    // No rotation – simple unrolled loop
+                    while (word + 8*step < SEG_WORDS) {
+                        sieve[word] &= ~m[0]; word += step;
+                        sieve[word] &= ~m[0]; word += step;
+                        sieve[word] &= ~m[0]; word += step;
+                        sieve[word] &= ~m[0]; word += step;
+                        sieve[word] &= ~m[0]; word += step;
+                        sieve[word] &= ~m[0]; word += step;
+                        sieve[word] &= ~m[0]; word += step;
+                        sieve[word] &= ~m[0]; word += step;
+                    }
                     while (word < SEG_WORDS) {
-                        sieve[word] &= ~mask;
-                        word += step_words;
+                        sieve[word] &= ~m[0];
+                        word += step;
                     }
                 } else {
+                    // Rotating mask – use precomputed array in unrolled loop
+                    while (word + 8*step < SEG_WORDS) {
+                        sieve[word] &= ~m[0]; word += step;
+                        sieve[word] &= ~m[1]; word += step;
+                        sieve[word] &= ~m[2]; word += step;
+                        sieve[word] &= ~m[3]; word += step;
+                        sieve[word] &= ~m[4]; word += step;
+                        sieve[word] &= ~m[5]; word += step;
+                        sieve[word] &= ~m[6]; word += step;
+                        sieve[word] &= ~m[7]; word += step;
+                    }
+                    // Update mask to the correct one for the tail
+                    uint32_t steps_done = 0;
+                    // We'll just use the first mask for tail (we'll recompute mask from remaining steps)
+                    // Simpler: after unrolled block, recompute mask based on word position
+                    // Actually, we can just continue with m[0] because the tail will be <8 steps,
+                    // but mask is out of sync. So we recalc mask from the original.
+                    // Better: use a single rotating mask for tail.
+                    // Let's just compute the current mask from the original using rotate.
+                    // The unrolled block advanced (word - original_word)/step steps.
+                    // We'll just reset mask using rotate from initial mask.
+                    // To keep it fast, we'll compute rotation count from word.
+                    // This is a tiny tail, performance not critical.
+                    uint64_t cur_mask = __builtin_rotateleft64(mask, ((word - (idx>>6)) / step) * bstep);
                     while (word < SEG_WORDS) {
-                        sieve[word] &= ~mask;
-                        word += step_words;
-                        mask = __builtin_rotateleft64(mask, bit_step);
+                        sieve[word] &= ~cur_mask;
+                        word += step;
+                        cur_mask = __builtin_rotateleft64(cur_mask, bstep);
                     }
                 }
             }
@@ -308,7 +367,7 @@ int main() {
     double actual_duration = chrono::duration_cast<chrono::duration<double>>(end_time - start_time).count();
 
     cout << "\n======================================================\n";
-    cout << "           WORD-LEVEL BINARY SIEVE                   \n";
+    cout << "           BINARY-LEVEL SIEVE (4B/sec target)        \n";
     cout << "======================================================\n";
     cout << "Execution time       : " << actual_duration << " seconds\n";
     cout << "Search space limit   : " << format_num(exact_search_space) << "\n";

@@ -5,12 +5,14 @@
 #include <chrono>
 #include <cmath>
 #include <string>
-#include <cstring> // Required for fast memset
+#include <cstring> 
 
 using namespace std;
 using namespace std::chrono;
 
-const uint64_t SEGMENT_BYTES = 32768; 
+// The LCM of 3, 5, 7, 11, 13 is 15015. 
+// Doubled to 30030, it fits the ~32KB L1 cache flawlessly and repeats perfectly.
+const uint64_t SEGMENT_BYTES = 30030; 
 const uint64_t SEGMENT_SPAN = SEGMENT_BYTES * 2; 
 const uint32_t MAX_BASE = 1000000; 
 
@@ -19,6 +21,7 @@ atomic<bool> time_up{false};
 atomic<uint64_t> total_primes{0};
 
 vector<uint32_t> base_primes;
+alignas(64) uint8_t pre_sieved_pattern[SEGMENT_BYTES];
 
 string format_num(uint64_t n) {
     string s = to_string(n);
@@ -30,9 +33,20 @@ string format_num(uint64_t n) {
     return s;
 }
 
+void init_pattern() {
+    memset(pre_sieved_pattern, 1, SEGMENT_BYTES);
+    // Pre-calculate multiples of the heaviest small primes
+    uint32_t presieved[] = {3, 5, 7, 11, 13};
+    for (uint32_t p : presieved) {
+        // Because SEGMENT_SPAN (60060) is perfectly divisible by these primes,
+        // this exact byte pattern maps flawlessly onto every single chunk.
+        for (uint64_t i = p / 2; i < SEGMENT_BYTES; i += p) {
+            pre_sieved_pattern[i] = 0;
+        }
+    }
+}
+
 void sieve_worker() {
-    // alignas(64) ensures the array aligns perfectly with modern CPU cache lines.
-    // This prevents cache-line tearing and speeds up SIMD vectorization.
     alignas(64) uint8_t sieve[SEGMENT_BYTES];
     uint64_t local_primes = 0;
 
@@ -41,25 +55,23 @@ void sieve_worker() {
         uint64_t low = block * SEGMENT_SPAN;
         uint64_t high = low + SEGMENT_SPAN;
 
-        // Raw C memset is hardware-optimized and faster than std::fill
-        memset(sieve, 1, SEGMENT_BYTES);
+        // INSTANT O(1) SIEVING: Blast the pre-solved template into L1 Cache
+        memcpy(sieve, pre_sieved_pattern, SEGMENT_BYTES);
 
+        // Start sieving from 17, skipping the heaviest CPU work entirely
         for (uint32_t p : base_primes) {
-            if (p == 2) continue;
             uint64_t p_sq = (uint64_t)p * p;
             if (p_sq >= high) break;
 
             uint64_t start = (low >= p_sq) ? low + (p - low % p) % p : p_sq;
             if (start % 2 == 0) start += p;
 
-            // Hot loop - no branch predictions needed here
             for (uint64_t j = (start - low) / 2; j < SEGMENT_BYTES; j += p) {
                 sieve[j] = 0;
             }
         }
 
         uint64_t count = 0;
-        // The -funroll-loops flag will auto-vectorize this loop using SIMD instructions
         for (uint32_t i = 0; i < SEGMENT_BYTES; ++i) {
             count += sieve[i];
         }
@@ -69,7 +81,9 @@ void sieve_worker() {
 }
 
 int main() {
-    cout << "Initializing base primes up to " << format_num(MAX_BASE) << "...\n";
+    cout << "Initializing algorithmic template cache...\n";
+    init_pattern();
+    
     vector<bool> is_prime(MAX_BASE + 1, true);
     is_prime[0] = is_prime[1] = false;
     for (uint32_t p = 2; p * p <= MAX_BASE; p++) {
@@ -79,10 +93,12 @@ int main() {
     }
     
     uint64_t block_0_primes = 0;
-    for (uint32_t p = 2; p <= MAX_BASE; p++) {
+    // We already handled 2, 3, 5, 7, 11, 13. Feed only primes >= 17 to workers.
+    for (uint32_t p = 17; p <= MAX_BASE; p++) {
         if (is_prime[p]) base_primes.push_back(p);
     }
     
+    // Manually tally Block 0 [0 to 60060] to ensure strict mathematical accuracy
     for(uint32_t i = 0; i < SEGMENT_SPAN; i++) {
         if(i <= MAX_BASE && is_prime[i]) block_0_primes++;
     }
@@ -100,7 +116,6 @@ int main() {
         workers.emplace_back(sieve_worker);
     }
 
-    // New progress bar supervisor loop
     int total_duration = 90;
     int last_printed_sec = -1;
 
@@ -111,11 +126,10 @@ int main() {
         if (elapsed >= total_duration) break;
 
         int current_sec = (int)elapsed;
-        // Only redraw the bar once per second to prevent I/O spam
         if (current_sec != last_printed_sec) {
             int left = total_duration - current_sec;
             float progress = (float)elapsed / total_duration;
-            int bar_width = 30; // Fits well on mobile screens
+            int bar_width = 30; 
             int pos = bar_width * progress;
 
             cout << "\r[";
@@ -128,14 +142,10 @@ int main() {
             
             last_printed_sec = current_sec;
         }
-        
-        // Sleep for a short burst so we don't block the 90s cutoff
         this_thread::sleep_for(milliseconds(100)); 
     }
     time_up.store(true, memory_order_relaxed);
-    
-    // Clear the progress bar line so the final report prints cleanly
-    cout << "\r" << string(60, ' ') << "\r";
+    cout << "\r" << string(60, ' ') << "\r"; 
 
     for (auto& w : workers) {
         w.join();

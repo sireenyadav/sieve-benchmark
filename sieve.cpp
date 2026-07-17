@@ -100,10 +100,42 @@ int main() {
         workers.emplace_back(sieve_worker);
     }
 
-    while (duration_cast<seconds>(steady_clock::now() - start_time).count() < 90) {
-        this_thread::sleep_for(milliseconds(50));
+    // New progress bar supervisor loop
+    int total_duration = 90;
+    int last_printed_sec = -1;
+
+    while (true) {
+        auto now = steady_clock::now();
+        double elapsed = duration_cast<duration<double>>(now - start_time).count();
+
+        if (elapsed >= total_duration) break;
+
+        int current_sec = (int)elapsed;
+        // Only redraw the bar once per second to prevent I/O spam
+        if (current_sec != last_printed_sec) {
+            int left = total_duration - current_sec;
+            float progress = (float)elapsed / total_duration;
+            int bar_width = 30; // Fits well on mobile screens
+            int pos = bar_width * progress;
+
+            cout << "\r[";
+            for (int i = 0; i < bar_width; ++i) {
+                if (i < pos) cout << "=";
+                else if (i == pos) cout << ">";
+                else cout << " ";
+            }
+            cout << "] " << current_sec << "s done / " << left << "s left" << flush;
+            
+            last_printed_sec = current_sec;
+        }
+        
+        // Sleep for a short burst so we don't block the 90s cutoff
+        this_thread::sleep_for(milliseconds(100)); 
     }
     time_up.store(true, memory_order_relaxed);
+    
+    // Clear the progress bar line so the final report prints cleanly
+    cout << "\r" << string(60, ' ') << "\r";
 
     for (auto& w : workers) {
         w.join();

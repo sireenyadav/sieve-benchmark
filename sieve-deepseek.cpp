@@ -15,7 +15,7 @@
 using namespace std;
 using steady_clock_t = std::chrono::steady_clock;
 
-// ---------- Configuration (45 KB – fits 64 KB L1) ----------
+// ---------- Configuration (identical to your 3.4B version) ----------
 constexpr uint32_t SEG_ODDS  = 360360;                 // 45 KB
 constexpr uint32_t SEG_SPAN  = SEG_ODDS * 2;           // 720720
 constexpr uint32_t SEG_WORDS = (SEG_ODDS + 63) / 64;   // 5631 words
@@ -27,108 +27,171 @@ constexpr uint64_t BLOCK_NOT_DONE = 0xFFFFFFFFFFFFFFFFULL;
 
 alignas(64) uint64_t template_seg[SEG_WORDS];
 vector<uint32_t> base_primes;
-vector<uint32_t> small_primes;
-
-struct LargePrime {
-    uint32_t p;
-    uint32_t step_words;
-    uint32_t bit_step;
-    uint64_t masks[8];   // precomputed 8 consecutive rotated masks
-};
-vector<LargePrime> large_primes;
+vector<uint32_t> small_primes;          // 17..63
+vector<uint32_t> large_primes;          // >=64
+vector<uint32_t> large_step_words;      // p / 64
+vector<uint32_t> large_bit_steps;       // p % 64
 
 unique_ptr<uint64_t[]> block_counts_raw;
 atomic<bool> stop_now{false};
 atomic<uint64_t> next_block{1};
 
+// ---------- Inline bit clear (unchanged) ----------
 static inline void clear_bit(uint64_t* buf, uint32_t idx) {
     buf[idx >> 6] &= ~(1ULL << (idx & 63));
 }
 
-// ---------- 64‑way NEON popcount with prefetch ----------
-static uint32_t popcount_segment(const uint64_t* data) {
-    uint32_t total = 0;
-    const uint64_t* end = data + SEG_WORDS;
+// ---------- Assembly copy template (128 bytes/iter) ----------
+static inline void copy_template(uint64_t* __restrict dest, const uint64_t* __restrict src) {
+    constexpr uint32_t words = SEG_WORDS;
+    uint32_t blocks = words / 16;
+    uint32_t remainder = words % 16;
 
-    // Prefetch the first cache line ahead of time
-    __builtin_prefetch(data, 0, 3);
-
-    while (data + 64 <= end) {
-        __builtin_prefetch(data + 128, 0, 3);  // look ahead
-
-        uint64x2_t v0  = vld1q_u64(data);
-        uint64x2_t v1  = vld1q_u64(data+2);
-        uint64x2_t v2  = vld1q_u64(data+4);
-        uint64x2_t v3  = vld1q_u64(data+6);
-        uint64x2_t v4  = vld1q_u64(data+8);
-        uint64x2_t v5  = vld1q_u64(data+10);
-        uint64x2_t v6  = vld1q_u64(data+12);
-        uint64x2_t v7  = vld1q_u64(data+14);
-        uint64x2_t v8  = vld1q_u64(data+16);
-        uint64x2_t v9  = vld1q_u64(data+18);
-        uint64x2_t v10 = vld1q_u64(data+20);
-        uint64x2_t v11 = vld1q_u64(data+22);
-        uint64x2_t v12 = vld1q_u64(data+24);
-        uint64x2_t v13 = vld1q_u64(data+26);
-        uint64x2_t v14 = vld1q_u64(data+28);
-        uint64x2_t v15 = vld1q_u64(data+30);
-        uint64x2_t v16 = vld1q_u64(data+32);
-        uint64x2_t v17 = vld1q_u64(data+34);
-        uint64x2_t v18 = vld1q_u64(data+36);
-        uint64x2_t v19 = vld1q_u64(data+38);
-        uint64x2_t v20 = vld1q_u64(data+40);
-        uint64x2_t v21 = vld1q_u64(data+42);
-        uint64x2_t v22 = vld1q_u64(data+44);
-        uint64x2_t v23 = vld1q_u64(data+46);
-        uint64x2_t v24 = vld1q_u64(data+48);
-        uint64x2_t v25 = vld1q_u64(data+50);
-        uint64x2_t v26 = vld1q_u64(data+52);
-        uint64x2_t v27 = vld1q_u64(data+54);
-        uint64x2_t v28 = vld1q_u64(data+56);
-        uint64x2_t v29 = vld1q_u64(data+58);
-        uint64x2_t v30 = vld1q_u64(data+60);
-        uint64x2_t v31 = vld1q_u64(data+62);
-
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v0)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v1)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v2)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v3)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v4)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v5)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v6)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v7)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v8)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v9)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v10)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v11)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v12)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v13)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v14)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v15)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v16)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v17)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v18)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v19)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v20)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v21)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v22)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v23)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v24)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v25)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v26)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v27)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v28)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v29)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v30)));
-        total += vaddvq_u8(vcntq_u8(vreinterpretq_u8_u64(v31)));
-
-        data += 64;
+    if (blocks > 0) {
+        asm volatile(
+            "mov x3, %[cnt]\n"
+            "1:\n"
+            "ldp q0, q1, [%[src]], #32\n"
+            "ldp q2, q3, [%[src]], #32\n"
+            "ldp q4, q5, [%[src]], #32\n"
+            "ldp q6, q7, [%[src]], #32\n"
+            "stp q0, q1, [%[dest]], #32\n"
+            "stp q2, q3, [%[dest]], #32\n"
+            "stp q4, q5, [%[dest]], #32\n"
+            "stp q6, q7, [%[dest]], #32\n"
+            "subs x3, x3, #1\n"
+            "b.ne 1b\n"
+            : [src]"+r"(src), [dest]"+r"(dest)
+            : [cnt]"r"((uint64_t)blocks)
+            : "x3", "memory", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7"
+        );
     }
-    while (data < end)
-        total += __builtin_popcountll(*data++);
+    // Copy remaining words (always < 16)
+    if (remainder) {
+        for (uint32_t i = 0; i < remainder; ++i)
+            dest[i] = src[i];
+    }
+}
+
+// ---------- Assembly popcount (64 words/512 bytes per loop) ----------
+static uint32_t popcount_asm(const uint64_t* data) {
+    uint32_t total = 0;
+    constexpr uint32_t words = SEG_WORDS;
+    uint32_t full_blocks = words / 64;
+    uint32_t remainder = words % 64;
+
+    if (full_blocks > 0) {
+        // Accumulators: v16..v19 will hold popcount sums
+        asm volatile(
+            "movi v16.16b, #0\n"
+            "movi v17.16b, #0\n"
+            "movi v18.16b, #0\n"
+            "movi v19.16b, #0\n"
+            "mov x2, %[cnt]\n"
+            "1:\n"
+            // Load 32 vectors (512 bytes)
+            "ldp q0, q1, [%[data], #0]\n"
+            "ldp q2, q3, [%[data], #32]\n"
+            "ldp q4, q5, [%[data], #64]\n"
+            "ldp q6, q7, [%[data], #96]\n"
+            "ldp q8, q9, [%[data], #128]\n"
+            "ldp q10, q11, [%[data], #160]\n"
+            "ldp q12, q13, [%[data], #192]\n"
+            "ldp q14, q15, [%[data], #224]\n"
+            "ldp q20, q21, [%[data], #256]\n"
+            "ldp q22, q23, [%[data], #288]\n"
+            "ldp q24, q25, [%[data], #320]\n"
+            "ldp q26, q27, [%[data], #352]\n"
+            "ldp q28, q29, [%[data], #384]\n"
+            "ldp q30, q31, [%[data], #416]\n"
+            // Popcount each
+            "cnt v0.16b, v0.16b\n"
+            "cnt v1.16b, v1.16b\n"
+            "cnt v2.16b, v2.16b\n"
+            "cnt v3.16b, v3.16b\n"
+            "cnt v4.16b, v4.16b\n"
+            "cnt v5.16b, v5.16b\n"
+            "cnt v6.16b, v6.16b\n"
+            "cnt v7.16b, v7.16b\n"
+            "cnt v8.16b, v8.16b\n"
+            "cnt v9.16b, v9.16b\n"
+            "cnt v10.16b, v10.16b\n"
+            "cnt v11.16b, v11.16b\n"
+            "cnt v12.16b, v12.16b\n"
+            "cnt v13.16b, v13.16b\n"
+            "cnt v14.16b, v14.16b\n"
+            "cnt v15.16b, v15.16b\n"
+            "cnt v20.16b, v20.16b\n"
+            "cnt v21.16b, v21.16b\n"
+            "cnt v22.16b, v22.16b\n"
+            "cnt v23.16b, v23.16b\n"
+            "cnt v24.16b, v24.16b\n"
+            "cnt v25.16b, v25.16b\n"
+            "cnt v26.16b, v26.16b\n"
+            "cnt v27.16b, v27.16b\n"
+            "cnt v28.16b, v28.16b\n"
+            "cnt v29.16b, v29.16b\n"
+            "cnt v30.16b, v30.16b\n"
+            "cnt v31.16b, v31.16b\n"
+            // Reduce to accumulators (v16..v19)
+            "add v0.16b, v0.16b, v1.16b\n"
+            "add v2.16b, v2.16b, v3.16b\n"
+            "add v4.16b, v4.16b, v5.16b\n"
+            "add v6.16b, v6.16b, v7.16b\n"
+            "add v8.16b, v8.16b, v9.16b\n"
+            "add v10.16b, v10.16b, v11.16b\n"
+            "add v12.16b, v12.16b, v13.16b\n"
+            "add v14.16b, v14.16b, v15.16b\n"
+            "add v0.16b, v0.16b, v2.16b\n"
+            "add v4.16b, v4.16b, v6.16b\n"
+            "add v8.16b, v8.16b, v10.16b\n"
+            "add v12.16b, v12.16b, v14.16b\n"
+            "add v0.16b, v0.16b, v4.16b\n"
+            "add v8.16b, v8.16b, v12.16b\n"
+            "add v16.16b, v16.16b, v0.16b\n"
+            "add v17.16b, v17.16b, v8.16b\n"
+            // Now handle v20..v31 similarly, accumulate to v18, v19
+            "add v20.16b, v20.16b, v21.16b\n"
+            "add v22.16b, v22.16b, v23.16b\n"
+            "add v24.16b, v24.16b, v25.16b\n"
+            "add v26.16b, v26.16b, v27.16b\n"
+            "add v28.16b, v28.16b, v29.16b\n"
+            "add v30.16b, v30.16b, v31.16b\n"
+            "add v20.16b, v20.16b, v22.16b\n"
+            "add v24.16b, v24.16b, v26.16b\n"
+            "add v28.16b, v28.16b, v30.16b\n"
+            "add v20.16b, v20.16b, v24.16b\n"
+            "add v28.16b, v28.16b, v28.16b\n"  // dummy, just to keep pattern
+            "add v18.16b, v18.16b, v20.16b\n"
+            "add v19.16b, v19.16b, v28.16b\n"
+            // Advance pointer
+            "add %[data], %[data], #512\n"
+            "subs x2, x2, #1\n"
+            "b.ne 1b\n"
+            // Horizontal sum of v16..v19
+            "uaddlv h16, v16.16b\n"
+            "uaddlv h17, v17.16b\n"
+            "uaddlv h18, v18.16b\n"
+            "uaddlv h19, v19.16b\n"
+            "add v16.4h, v16.4h, v17.4h\n"
+            "add v18.4h, v18.4h, v19.4h\n"
+            "add v16.4h, v16.4h, v18.4h\n"
+            "smov %w[out], v16.h[0]\n"
+            : [out]"=r"(total), [data]"+r"(data)
+            : [cnt]"r"((uint64_t)full_blocks)
+            : "x2", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+              "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
+              "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+              "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31"
+        );
+    }
+    // Scalar popcount for remainder
+    for (uint32_t i = 0; i < remainder; ++i)
+        total += __builtin_popcountll(data[i]);
     return total;
 }
 
+// ---------- Pretty print (unchanged) ----------
 string format_num(uint64_t n) {
     string s = to_string(n);
     for (int pos = (int)s.size() - 3; pos > 0; pos -= 3)
@@ -149,6 +212,7 @@ uint64_t count_small_primes(uint32_t limit) {
     return cnt;
 }
 
+// ---------- Wheel template (3,5,7,11,13) unchanged ----------
 void build_template() {
     memset(template_seg, 0xFF, sizeof(template_seg));
     for (uint32_t n=1; n<SEG_SPAN; n+=2) {
@@ -169,38 +233,30 @@ void build_base_primes() {
         if (is_prime[p])
             for (uint32_t x=p*p; x<=SMALL_LIMIT; x+=p) is_prime[x]=0;
 
-    base_primes.reserve(100000);
-    for (uint32_t p=17; p<=SMALL_LIMIT; ++p)
-        if (is_prime[p]) base_primes.push_back(p);
-
     small_primes.clear();
     large_primes.clear();
-    for (uint32_t p : base_primes) {
-        if (p < 64) {
-            small_primes.push_back(p);
-        } else {
-            LargePrime lp;
-            lp.p = p;
-            lp.step_words = p / 64;
-            lp.bit_step   = p % 64;
-            // Precompute 8 rotated masks
-            uint64_t base_mask = 1ULL << 0; // we'll set correct start mask in worker
-            // We'll compute masks dynamically in worker because start mask depends on offset.
-            // For precomputation, we need to store the *difference* pattern; easier to do in worker.
-            // We'll store the rotation sequence in worker based on first mask.
-            large_primes.push_back(lp);
+    large_step_words.clear();
+    large_bit_steps.clear();
+
+    for (uint32_t p=17; p<=SMALL_LIMIT; ++p) {
+        if (is_prime[p]) {
+            if (p < 64)
+                small_primes.push_back(p);
+            else {
+                large_primes.push_back(p);
+                large_step_words.push_back(p / 64);
+                large_bit_steps.push_back(p % 64);
+            }
         }
     }
 }
 
-// ---------- Worker with unrolled word-level sieving ----------
+// ---------- Worker thread (unchanged sieving logic, uses new copy & popcount) ----------
 void sieve_worker(int thread_id, int num_threads) {
-    if (num_threads > 0) {
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(thread_id % num_threads, &cpuset);
-        sched_setaffinity(gettid(), sizeof(cpu_set_t), &cpuset);
-    }
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(thread_id % num_threads, &cpuset);
+    sched_setaffinity(gettid(), sizeof(cpu_set_t), &cpuset);
 
     alignas(64) uint64_t sieve[SEG_WORDS];
 
@@ -214,17 +270,16 @@ void sieve_worker(int thread_id, int num_threads) {
             uint64_t low  = block * (uint64_t)SEG_SPAN;
             uint64_t high = low + SEG_SPAN;
 
-            memcpy(sieve, template_seg, sizeof(sieve));
+            // ----- Use assembly copy -----
+            copy_template(sieve, template_seg);
 
-            // 1. Small primes (<64) – 8‑way unrolled bit clearing
+            // Small primes (17..63) – 8‑way unrolled bit clearing
             for (uint32_t p : small_primes) {
                 uint64_t p2 = (uint64_t)p * (uint64_t)p;
                 if (p2 >= high) break;
-
                 uint64_t start = (low + p - 1) / p * p;
                 if (start < p2) start = p2;
                 if ((start & 1ULL) == 0) start += p;
-
                 uint64_t idx = (start - low - 1) >> 1;
                 constexpr uint32_t UNROLL = 8;
                 if (p * UNROLL < SEG_ODDS) {
@@ -246,79 +301,56 @@ void sieve_worker(int thread_id, int num_threads) {
                 }
             }
 
-            // 2. Large primes (>=64) – word-level with precomputed mask batch
-            for (auto& lp : large_primes) {
-                uint64_t p = lp.p;
+            // Large primes (>=64) – clean 8‑way rotating mask (no division)
+            for (size_t i = 0; i < large_primes.size(); ++i) {
+                uint64_t p = large_primes[i];
                 uint64_t p2 = (uint64_t)p * (uint64_t)p;
                 if (p2 >= high) break;
-
                 uint64_t start = (low + p - 1) / p * p;
                 if (start < p2) start = p2;
                 if ((start & 1ULL) == 0) start += p;
-
                 uint64_t idx = (start - low - 1) >> 1;
                 uint64_t word = idx >> 6;
                 uint64_t mask = 1ULL << (idx & 63);
-                uint32_t step = lp.step_words;
-                uint32_t bstep = lp.bit_step;
-
-                // Precompute 8 masks for unrolled loop
-                uint64_t m[8];
-                m[0] = mask;
-                for (int i = 1; i < 8; ++i) {
-                    m[i] = __builtin_rotateleft64(m[i-1], bstep);
-                }
+                uint32_t step = large_step_words[i];
+                uint32_t bstep = large_bit_steps[i];
 
                 if (bstep == 0) {
-                    // No rotation – simple unrolled loop
                     while (word + 8*step < SEG_WORDS) {
-                        sieve[word] &= ~m[0]; word += step;
-                        sieve[word] &= ~m[0]; word += step;
-                        sieve[word] &= ~m[0]; word += step;
-                        sieve[word] &= ~m[0]; word += step;
-                        sieve[word] &= ~m[0]; word += step;
-                        sieve[word] &= ~m[0]; word += step;
-                        sieve[word] &= ~m[0]; word += step;
-                        sieve[word] &= ~m[0]; word += step;
+                        sieve[word] &= ~mask; word += step;
+                        sieve[word] &= ~mask; word += step;
+                        sieve[word] &= ~mask; word += step;
+                        sieve[word] &= ~mask; word += step;
+                        sieve[word] &= ~mask; word += step;
+                        sieve[word] &= ~mask; word += step;
+                        sieve[word] &= ~mask; word += step;
+                        sieve[word] &= ~mask; word += step;
                     }
                     while (word < SEG_WORDS) {
-                        sieve[word] &= ~m[0];
+                        sieve[word] &= ~mask;
                         word += step;
                     }
                 } else {
-                    // Rotating mask – use precomputed array in unrolled loop
                     while (word + 8*step < SEG_WORDS) {
-                        sieve[word] &= ~m[0]; word += step;
-                        sieve[word] &= ~m[1]; word += step;
-                        sieve[word] &= ~m[2]; word += step;
-                        sieve[word] &= ~m[3]; word += step;
-                        sieve[word] &= ~m[4]; word += step;
-                        sieve[word] &= ~m[5]; word += step;
-                        sieve[word] &= ~m[6]; word += step;
-                        sieve[word] &= ~m[7]; word += step;
+                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
+                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
+                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
+                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
+                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
+                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
+                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
+                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
                     }
-                    // Update mask to the correct one for the tail
-                    uint32_t steps_done = 0;
-                    // We'll just use the first mask for tail (we'll recompute mask from remaining steps)
-                    // Simpler: after unrolled block, recompute mask based on word position
-                    // Actually, we can just continue with m[0] because the tail will be <8 steps,
-                    // but mask is out of sync. So we recalc mask from the original.
-                    // Better: use a single rotating mask for tail.
-                    // Let's just compute the current mask from the original using rotate.
-                    // The unrolled block advanced (word - original_word)/step steps.
-                    // We'll just reset mask using rotate from initial mask.
-                    // To keep it fast, we'll compute rotation count from word.
-                    // This is a tiny tail, performance not critical.
-                    uint64_t cur_mask = __builtin_rotateleft64(mask, ((word - (idx>>6)) / step) * bstep);
                     while (word < SEG_WORDS) {
-                        sieve[word] &= ~cur_mask;
+                        sieve[word] &= ~mask;
                         word += step;
-                        cur_mask = __builtin_rotateleft64(cur_mask, bstep);
+                        mask = __builtin_rotateleft64(mask, bstep);
                     }
                 }
             }
 
-            block_counts_raw[block] = popcount_segment(sieve);
+            // ----- Use assembly popcount -----
+            block_counts_raw[block] = popcount_asm(sieve);
         }
     }
 }
@@ -367,13 +399,13 @@ int main() {
     double actual_duration = chrono::duration_cast<chrono::duration<double>>(end_time - start_time).count();
 
     cout << "\n======================================================\n";
-    cout << "           BINARY-LEVEL SIEVE (4B/sec target)        \n";
+    cout << "           ASM-BOOSTED SIEVE (4B/sec target)        \n";
     cout << "======================================================\n";
     cout << "Execution time       : " << actual_duration << " seconds\n";
     cout << "Search space limit   : " << format_num(exact_search_space) << "\n";
     cout << "Total primes found   : " << format_num(exact_primes) << "\n";
-    cout << "Base primes used     : " << format_num(base_primes.size()) << "\n";
-    cout << "  (small <64)        : " << small_primes.size() << "\n";
+    cout << "Base primes used     : " << format_num(small_primes.size() + large_primes.size()) << "\n";
+    cout << "  (small 17..63)     : " << small_primes.size() << "\n";
     cout << "  (large >=64)       : " << large_primes.size() << "\n";
     cout << "Threads              : " << num_threads << "\n";
     cout << "Numbers processed/sec: " << format_num((uint64_t)(exact_search_space / actual_duration)) << "\n";

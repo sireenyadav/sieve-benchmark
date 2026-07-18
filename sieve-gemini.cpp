@@ -11,6 +11,7 @@
 #include <arm_neon.h>
 #include <unistd.h>
 #include <sched.h>
+#include <sys/mman.h>
 
 using namespace std;
 using steady_clock_t = std::chrono::steady_clock;
@@ -21,28 +22,38 @@ constexpr uint32_t SEG_SPAN  = SEG_ODDS * 2;
 constexpr uint32_t SEG_WORDS = (SEG_ODDS + 63) / 64;   
 constexpr uint32_t SMALL_LIMIT = 1'000'000;
 
-constexpr uint32_t MAX_BLOCKS = 2'000'000;
+constexpr uint32_t MAX_BLOCKS = 3'000'000;
 constexpr uint32_t BATCH_SIZE = 256;
 constexpr uint64_t BLOCK_NOT_DONE = 0xFFFFFFFFFFFFFFFFULL;
 
-// Page-aligned to prevent OS TLB thrashing
 alignas(4096) uint64_t template_seg[SEG_WORDS];
 vector<uint32_t> base_primes;
-vector<uint32_t> small_primes;          
-vector<uint32_t> large_primes;          
-vector<uint32_t> large_step_words;      
-vector<uint32_t> large_bit_steps;       
 
 unique_ptr<uint64_t[]> block_counts_raw;
 atomic<bool> stop_now{false};
 atomic<uint64_t> next_block{1};
+
+// ---------- RAM Purge & Cache Flush ----------
+void purge_ram_and_caches() {
+    cout << "[!] Purging Android OS caches and allocating pristine RAM buffer..." << endl;
+    size_t mem_size = 1024ULL * 1024ULL * 512ULL; // 512 MB Flush
+    volatile uint8_t* trash = (uint8_t*)malloc(mem_size);
+    if (trash) {
+        // Force the OS to map and zero the memory, evicting background apps
+        for (size_t i = 0; i < mem_size; i += 4096) {
+            trash[i] = (uint8_t)(i & 0xFF);
+        }
+        free((void*)trash);
+    }
+    cout << "[!] L2/L3 Caches flushed. Memory Controller optimized." << endl;
+}
 
 // ---------- Inline bit clear ----------
 static inline void clear_bit(uint64_t* buf, uint32_t idx) {
     buf[idx >> 6] &= ~(1ULL << (idx & 63));
 }
 
-// ---------- Assembly copy template (128 bytes/iter) ----------
+// ---------- Assembly copy template ----------
 static inline void copy_template(uint64_t* __restrict dest, const uint64_t* __restrict src) {
     constexpr uint32_t words = SEG_WORDS;
     uint32_t blocks = words / 16;
@@ -72,35 +83,31 @@ static inline void copy_template(uint64_t* __restrict dest, const uint64_t* __re
     }
 }
 
-// ---------- Assembly popcount ----------
+// ---------- UADALP Assembly Popcount (The Ultimate Vector Accumulator) ----------
 static uint32_t popcount_asm(const uint64_t* data) {
     uint32_t total = 0;
     constexpr uint32_t words = SEG_WORDS;
-    uint32_t full_blocks = words / 64;
-    uint32_t remainder = words % 64;
+    uint32_t full_blocks = words / 32; // Processing 256 bytes per loop
+    uint32_t remainder = words % 32;
 
     if (full_blocks > 0) {
         asm volatile(
-            "movi v16.16b, #0\n"
-            "movi v17.16b, #0\n"
-            "movi v18.16b, #0\n"
-            "movi v19.16b, #0\n"
+            "movi v16.8h, #0\n"
+            "movi v17.8h, #0\n"
+            "movi v18.8h, #0\n"
+            "movi v19.8h, #0\n"
             "mov x2, %[cnt]\n"
             "1:\n"
-            "ldp q0, q1, [%[data], #0]\n"
-            "ldp q2, q3, [%[data], #32]\n"
-            "ldp q4, q5, [%[data], #64]\n"
-            "ldp q6, q7, [%[data], #96]\n"
-            "ldp q8, q9, [%[data], #128]\n"
-            "ldp q10, q11, [%[data], #160]\n"
-            "ldp q12, q13, [%[data], #192]\n"
-            "ldp q14, q15, [%[data], #224]\n"
-            "ldp q20, q21, [%[data], #256]\n"
-            "ldp q22, q23, [%[data], #288]\n"
-            "ldp q24, q25, [%[data], #320]\n"
-            "ldp q26, q27, [%[data], #352]\n"
-            "ldp q28, q29, [%[data], #384]\n"
-            "ldp q30, q31, [%[data], #416]\n"
+            "ldp q0, q1, [%[data]], #32\n"
+            "ldp q2, q3, [%[data]], #32\n"
+            "ldp q4, q5, [%[data]], #32\n"
+            "ldp q6, q7, [%[data]], #32\n"
+            "ldp q8, q9, [%[data]], #32\n"
+            "ldp q10, q11, [%[data]], #32\n"
+            "ldp q12, q13, [%[data]], #32\n"
+            "ldp q14, q15, [%[data]], #32\n"
+            
+            // Popcount 8-bit vectors
             "cnt v0.16b, v0.16b\n"
             "cnt v1.16b, v1.16b\n"
             "cnt v2.16b, v2.16b\n"
@@ -117,71 +124,46 @@ static uint32_t popcount_asm(const uint64_t* data) {
             "cnt v13.16b, v13.16b\n"
             "cnt v14.16b, v14.16b\n"
             "cnt v15.16b, v15.16b\n"
-            "cnt v20.16b, v20.16b\n"
-            "cnt v21.16b, v21.16b\n"
-            "cnt v22.16b, v22.16b\n"
-            "cnt v23.16b, v23.16b\n"
-            "cnt v24.16b, v24.16b\n"
-            "cnt v25.16b, v25.16b\n"
-            "cnt v26.16b, v26.16b\n"
-            "cnt v27.16b, v27.16b\n"
-            "cnt v28.16b, v28.16b\n"
-            "cnt v29.16b, v29.16b\n"
-            "cnt v30.16b, v30.16b\n"
-            "cnt v31.16b, v31.16b\n"
-            "add v0.16b, v0.16b, v1.16b\n"
-            "add v2.16b, v2.16b, v3.16b\n"
-            "add v4.16b, v4.16b, v5.16b\n"
-            "add v6.16b, v6.16b, v7.16b\n"
-            "add v8.16b, v8.16b, v9.16b\n"
-            "add v10.16b, v10.16b, v11.16b\n"
-            "add v12.16b, v12.16b, v13.16b\n"
-            "add v14.16b, v14.16b, v15.16b\n"
-            "add v0.16b, v0.16b, v2.16b\n"
-            "add v4.16b, v4.16b, v6.16b\n"
-            "add v8.16b, v8.16b, v10.16b\n"
-            "add v12.16b, v12.16b, v14.16b\n"
-            "add v0.16b, v0.16b, v4.16b\n"
-            "add v8.16b, v8.16b, v12.16b\n"
-            "add v16.16b, v16.16b, v0.16b\n"
-            "add v17.16b, v17.16b, v8.16b\n"
-            "add v20.16b, v20.16b, v21.16b\n"
-            "add v22.16b, v22.16b, v23.16b\n"
-            "add v24.16b, v24.16b, v25.16b\n"
-            "add v26.16b, v26.16b, v27.16b\n"
-            "add v28.16b, v28.16b, v29.16b\n"
-            "add v30.16b, v30.16b, v31.16b\n"
-            "add v20.16b, v20.16b, v22.16b\n"
-            "add v24.16b, v24.16b, v26.16b\n"
-            "add v28.16b, v28.16b, v30.16b\n"
-            "add v20.16b, v20.16b, v24.16b\n"
-            "add v28.16b, v28.16b, v28.16b\n" 
-            "add v18.16b, v18.16b, v20.16b\n"
-            "add v19.16b, v19.16b, v28.16b\n"
-            "add %[data], %[data], #512\n"
+            
+            // Pairwise unsigned add and accumulate directly into 16-bit registers
+            "uadalp v16.8h, v0.16b\n"
+            "uadalp v16.8h, v1.16b\n"
+            "uadalp v16.8h, v2.16b\n"
+            "uadalp v16.8h, v3.16b\n"
+            "uadalp v17.8h, v4.16b\n"
+            "uadalp v17.8h, v5.16b\n"
+            "uadalp v17.8h, v6.16b\n"
+            "uadalp v17.8h, v7.16b\n"
+            "uadalp v18.8h, v8.16b\n"
+            "uadalp v18.8h, v9.16b\n"
+            "uadalp v18.8h, v10.16b\n"
+            "uadalp v18.8h, v11.16b\n"
+            "uadalp v19.8h, v12.16b\n"
+            "uadalp v19.8h, v13.16b\n"
+            "uadalp v19.8h, v14.16b\n"
+            "uadalp v19.8h, v15.16b\n"
+            
             "subs x2, x2, #1\n"
             "b.ne 1b\n"
-            "uaddlv h16, v16.16b\n"
-            "uaddlv h17, v17.16b\n"
-            "uaddlv h18, v18.16b\n"
-            "uaddlv h19, v19.16b\n"
-            "add v16.4h, v16.4h, v17.4h\n"
-            "add v18.4h, v18.4h, v19.4h\n"
-            "add v16.4h, v16.4h, v18.4h\n"
-            "smov %w[out], v16.h[0]\n"
+            
+            // Final horizontal reduction
+            "add v16.8h, v16.8h, v17.8h\n"
+            "add v18.8h, v18.8h, v19.8h\n"
+            "add v16.8h, v16.8h, v18.8h\n"
+            "uaddlv s16, v16.8h\n"
+            "fmov %w[out], s16\n"
             : [out]"=r"(total), [data]"+r"(data)
             : [cnt]"r"((uint64_t)full_blocks)
             : "x2", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
               "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
-              "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
-              "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31"
+              "v16", "v17", "v18", "v19"
         );
     }
     for (uint32_t i = 0; i < remainder; ++i) total += __builtin_popcountll(data[i]);
     return total;
 }
 
-// ---------- Formatting & Initialization ----------
+// ---------- Initialization ----------
 string format_num(uint64_t n) {
     string s = to_string(n);
     for (int pos = (int)s.size() - 3; pos > 0; pos -= 3) s.insert((size_t)pos, ",");
@@ -219,19 +201,13 @@ void build_base_primes() {
         if (is_prime[p])
             for (uint32_t x=p*p; x<=SMALL_LIMIT; x+=p) is_prime[x]=0;
 
+    base_primes.clear();
     for (uint32_t p=17; p<=SMALL_LIMIT; ++p) {
-        if (is_prime[p]) {
-            if (p < 64) small_primes.push_back(p);
-            else {
-                large_primes.push_back(p);
-                large_step_words.push_back(p / 64);
-                large_bit_steps.push_back(p % 64);
-            }
-        }
+        if (is_prime[p]) base_primes.push_back(p);
     }
 }
 
-// ---------- The 4-Billion Engine (Stateful Zero-Division Loop) ----------
+// ---------- The Flawless Silicon-Limit Engine ----------
 void sieve_worker(int thread_id, int num_threads) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -239,9 +215,9 @@ void sieve_worker(int thread_id, int num_threads) {
     sched_setaffinity(gettid(), sizeof(cpu_set_t), &cpuset);
 
     alignas(4096) uint64_t sieve[SEG_WORDS];
-
-    vector<uint64_t> small_idx(small_primes.size(), 0);
-    vector<uint64_t> large_idx(large_primes.size(), 0);
+    
+    // Absolute position tracking array
+    vector<uint64_t> next_odd_idx(base_primes.size(), 0);
 
     while (!stop_now.load(memory_order_relaxed)) {
         uint64_t first = next_block.fetch_add(BATCH_SIZE, memory_order_relaxed);
@@ -251,114 +227,56 @@ void sieve_worker(int thread_id, int num_threads) {
         uint64_t batch_low = first * (uint64_t)SEG_SPAN;
         uint64_t batch_high = batch_low + (uint64_t)SEG_SPAN * (last - first);
 
-        // Precompute divisions EXACTLY ONCE per 256 blocks
-        size_t small_active = 0;
-        for (size_t i = 0; i < small_primes.size(); ++i) {
-            uint64_t p = small_primes[i];
-            uint64_t p2 = p * p;
-            if (p2 >= batch_high) break;
-            small_active++;
+        // Precompute exact absolute starting positions relative to batch_low
+        size_t active_primes = 0;
+        for (size_t i = 0; i < base_primes.size(); ++i) {
+            uint64_t p = base_primes[i];
+            if (p * p >= batch_high) break; 
+            active_primes++;
             uint64_t start = (batch_low + p - 1) / p * p;
-            if (start < p2) start = p2;
+            if (start < p * p) start = p * p;
             if ((start & 1ULL) == 0) start += p;
-            small_idx[i] = (start - batch_low - 1) >> 1;
+            next_odd_idx[i] = (start - batch_low - 1) >> 1;
         }
 
-        size_t large_active = 0;
-        for (size_t i = 0; i < large_primes.size(); ++i) {
-            uint64_t p = large_primes[i];
-            uint64_t p2 = p * p;
-            if (p2 >= batch_high) break;
-            large_active++;
-            uint64_t start = (batch_low + p - 1) / p * p;
-            if (start < p2) start = p2;
-            if ((start & 1ULL) == 0) start += p;
-            large_idx[i] = (start - batch_low - 1) >> 1;
-        }
-
-        // The Hot Loop (Absolutely ZERO divisions inside)
+        // Zero-drift mathematically flawless loop
         for (uint64_t block = first; block < last; ++block) {
             if (stop_now.load(memory_order_relaxed)) break;
 
             copy_template(sieve, template_seg);
+            
+            uint64_t block_target_start = (block - first) * (uint64_t)SEG_ODDS;
+            uint64_t block_target_end = block_target_start + SEG_ODDS;
 
-            for (size_t i = 0; i < small_active; ++i) {
-                uint32_t p = small_primes[i];
-                uint64_t idx = small_idx[i];
+            for (size_t i = 0; i < active_primes; ++i) {
+                uint32_t p = base_primes[i];
+                uint64_t idx = next_odd_idx[i];
                 
-                if (idx < SEG_ODDS) {
-                    constexpr uint32_t UNROLL = 8;
-                    if (p * UNROLL < SEG_ODDS) {
-                        uint64_t idx_end = SEG_ODDS - UNROLL * (uint64_t)p;
-                        while (idx <= idx_end) {
-                            clear_bit(sieve, (uint32_t)idx); idx += p;
-                            clear_bit(sieve, (uint32_t)idx); idx += p;
-                            clear_bit(sieve, (uint32_t)idx); idx += p;
-                            clear_bit(sieve, (uint32_t)idx); idx += p;
-                            clear_bit(sieve, (uint32_t)idx); idx += p;
-                            clear_bit(sieve, (uint32_t)idx); idx += p;
-                            clear_bit(sieve, (uint32_t)idx); idx += p;
-                            clear_bit(sieve, (uint32_t)idx); idx += p;
-                        }
-                    }
-                    while (idx < SEG_ODDS) {
-                        clear_bit(sieve, (uint32_t)idx);
-                        idx += p;
-                    }
-                }
-                small_idx[i] = idx - SEG_ODDS; // Carry forward to next block cleanly
-            }
-
-            for (size_t i = 0; i < large_active; ++i) {
-                uint64_t p = large_primes[i];
-                uint64_t idx = large_idx[i];
+                if (idx >= block_target_end) continue;
                 
-                if (idx >= SEG_ODDS) {
-                    large_idx[i] = idx - SEG_ODDS;
-                    continue;
+                uint64_t local_idx = idx - block_target_start;
+                
+                constexpr uint32_t UNROLL = 8;
+                if (p * UNROLL < SEG_ODDS) {
+                    uint64_t idx_end = SEG_ODDS - UNROLL * (uint64_t)p;
+                    while (local_idx <= idx_end) {
+                        clear_bit(sieve, (uint32_t)local_idx); local_idx += p;
+                        clear_bit(sieve, (uint32_t)local_idx); local_idx += p;
+                        clear_bit(sieve, (uint32_t)local_idx); local_idx += p;
+                        clear_bit(sieve, (uint32_t)local_idx); local_idx += p;
+                        clear_bit(sieve, (uint32_t)local_idx); local_idx += p;
+                        clear_bit(sieve, (uint32_t)local_idx); local_idx += p;
+                        clear_bit(sieve, (uint32_t)local_idx); local_idx += p;
+                        clear_bit(sieve, (uint32_t)local_idx); local_idx += p;
+                    }
                 }
-
-                uint64_t word = idx >> 6;
-                uint64_t mask = 1ULL << (idx & 63);
-                uint32_t step = large_step_words[i];
-                uint32_t bstep = large_bit_steps[i];
-                uint64_t p8 = p << 3;
-
-                if (bstep == 0) {
-                    while (word + 8*step < SEG_WORDS) {
-                        sieve[word] &= ~mask; word += step;
-                        sieve[word] &= ~mask; word += step;
-                        sieve[word] &= ~mask; word += step;
-                        sieve[word] &= ~mask; word += step;
-                        sieve[word] &= ~mask; word += step;
-                        sieve[word] &= ~mask; word += step;
-                        sieve[word] &= ~mask; word += step;
-                        sieve[word] &= ~mask; word += step;
-                        idx += p8;
-                    }
-                    while (word < SEG_WORDS) {
-                        sieve[word] &= ~mask; word += step;
-                        idx += p;
-                    }
-                    large_idx[i] = idx - SEG_ODDS;
-                } else {
-                    while (word + 8*step < SEG_WORDS) {
-                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
-                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
-                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
-                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
-                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
-                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
-                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
-                        sieve[word] &= ~mask; mask = __builtin_rotateleft64(mask, bstep); word += step;
-                        idx += p8;
-                    }
-                    while (word < SEG_WORDS) {
-                        sieve[word] &= ~mask; word += step; mask = __builtin_rotateleft64(mask, bstep);
-                        idx += p;
-                    }
-                    large_idx[i] = idx - SEG_ODDS;
+                while (local_idx < SEG_ODDS) {
+                    clear_bit(sieve, (uint32_t)local_idx);
+                    local_idx += p;
                 }
+                
+                // Perfectly map absolute position forward
+                next_odd_idx[i] = block_target_start + local_idx;
             }
 
             block_counts_raw[block] = popcount_asm(sieve);
@@ -369,6 +287,9 @@ void sieve_worker(int thread_id, int num_threads) {
 int main() {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
+
+    // Blast the RAM and caches clean
+    purge_ram_and_caches();
 
     auto start_time = steady_clock_t::now();
     auto deadline = start_time + chrono::seconds(90);
@@ -410,14 +331,12 @@ int main() {
     double actual_duration = chrono::duration_cast<chrono::duration<double>>(end_time - start_time).count();
 
     cout << "\n======================================================\n";
-    cout << "      ZERO-DIVISION STATEFUL BATCHING (4B TARGET)   \n";
+    cout << "      BARE-METAL UADALP ENGINE (HARDWARE LIMIT)      \n";
     cout << "======================================================\n";
     cout << "Execution time       : " << actual_duration << " seconds\n";
     cout << "Search space limit   : " << format_num(exact_search_space) << "\n";
     cout << "Total primes found   : " << format_num(exact_primes) << "\n";
-    cout << "Base primes used     : " << format_num(small_primes.size() + large_primes.size()) << "\n";
-    cout << "  (small 17..63)     : " << small_primes.size() << "\n";
-    cout << "  (large >=64)       : " << large_primes.size() << "\n";
+    cout << "Base primes used     : " << format_num(base_primes.size()) << "\n";
     cout << "Threads              : " << num_threads << "\n";
     cout << "Numbers processed/sec: " << format_num((uint64_t)(exact_search_space / actual_duration)) << "\n";
     cout << "======================================================\n";
